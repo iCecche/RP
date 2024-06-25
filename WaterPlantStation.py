@@ -355,7 +355,7 @@ def main():
     
     #   Data pin
     waterPump = Pin(0, Pin.OUT) #relay data pin
-    tempsensor = dht.DHT11(Pin(3, Pin.IN)) #digital read value pin
+    tempsensor = dht.DHT22(Pin(3, Pin.IN)) #digital read value pin
     soil = ADC(Pin(26)) #analog value pin
     battery = ADC(Pin(28))
     
@@ -382,11 +382,17 @@ def main():
             print("soil limit ", MOISTURELIMIT)
             print("irrigate now: ", IRRIGATE_NOW)
 
+            tempsensor.measure()
+            temperature = tempsensor.temperature()
+            humidity = tempsensor.humidity()
+
+            print("Temp: ", temperature)
+            print("Hum: ", humidity)
+
             moisture = soil.read_u16()
             moisture = mapValue(moisture,39500,14000,0,100)
             print("moisture: " + "%.2f" % moisture +"% (adc: "+str(soil.read_u16())+")")
             
-           
             battery_level = medium_battery_level(battery)
             print("battery_level: " + "%.2f" % battery_level +"V")
             
@@ -401,7 +407,7 @@ def main():
                  SETTINGS_SAVED = False
                  
             writelogs('logfile.txt', time_of_misuration)
-            data = json.dumps(makeData(0,0,moisture, time_of_misuration, battery_level))
+            data = json.dumps(makeData(temperature, humidity, moisture, time_of_misuration, battery_level))
             publish(client,"picoW/sensor",data)
             
             gosleepsensors(tempsensor_power,soil_power)
