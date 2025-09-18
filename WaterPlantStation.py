@@ -6,9 +6,11 @@
 #    - added custom deepsleep with very low energy consumption (in previous commit)
 #    - added implementation for irrigation from dashboard (using mqtt expiring message) and support for modification for station parameter (moisture_limit, pump_active_for...) (in previous commit)
 #    - added status led (ON during operations/measurement - OFF on deepsleep); onboard led
+#    - use an external secrets.py file to store wifi and mqtt credentials
 
-from machine import Pin, ADC, reset, RTC
-from time import sleep, localtime, time
+from machine import Pin, ADC, reset
+from time import sleep
+import secrets
 import network
 import sys
 import utime
@@ -21,97 +23,101 @@ import uio
 #third-part library mqtt
 from umqtt.simple  import MQTTClient
 
-VOLTAGE_DROP_FACTOR = 1.519
+VOLTAGE_DROP_FACTOR = 2.2
 
-MOISTURELIMIT = 15
-ACTIVATE_PUMP_FOR = 5
-MISURATION_INTERVAL = 1 * 60 * 60 * 1000
-LAST_IRRIGATION = 0
-IRRIGATE_NOW = False
+SETTINGS_FILE = "settings.txt"
 SETTINGS_SAVED = True
-
-OFFSET = 1 * 60 * 60
-
+SETTINGS = {
+    "MOISTURE_LIMIT": 15,
+    "ACTIVE_PUMP_FOR": 5,
+    "MISURATION_INTERVAL": 3600,
+    "LAST_IRRIGATION": 0
+}
+IRRIGATE_NOW = False
 
 def connectWifi():
-    SSID = "Your SSID"
-    PASSWORD = "Your PASSWORD"
-    
-    max_wait = 20
-    wlan = network.WLAN(network.STA_IF)
-    wlan.active(True)
-    try:
-        wlan.connect(SSID,PASSWORD)
-        while max_wait > 0:
-            if wlan.status() < 0 or wlan.status() >= 3:
-                break
-            max_wait -= 1
-            print('waiting for connection...')
-            sleep(1)
-        
-        if wlan.status() != 3:
-            raise RuntimeError('wifi connection failed')
-        
-    except Exception as e:
-        writelogs('logfile.txt', "Error: " + str(e))
-        raise RuntimeError('wifi connection failed')
-    
-    if wlan.isconnected() == True:
-         
-        print("connected")
-        status = wlan.ifconfig()
-        print('ip = ' + status[0])
-        sleep(2)
-        
-        set_time()
+    station = network.WLAN(network.STA_IF)
+    station.active(True)
 
-#sets time on the pico via ntp server and manages automatic summer time changes; set RTC with the current time from NTP
+    if not station.isconnected():
+        print("Connecting...")
+        station.connect(secrets.SSID, secrets.PASSWORD)
+
+        while not station.isconnected():
+            print(".", end="")
+            sleep(1)
+
+    if station.isconnected():
+        print("Connected!")
+        print("My IP Address:", station.ifconfig()[0])
+    else:
+        print("Failed to connect to wifi")
+        raise RuntimeError('Failed to connect to wifi')
+
+    sleep(1)
+    set_time()
+
+# sets time on the pico via ntp server and manages automatic summer time changes; set RTC with the current time from NTP
 def set_time():
-    
-    ntptime.host = 'pool.ntp.org'  # Using a public NTP server
+    ntptime.host = 'pool.ntp.org'
+
     try:
-        ntptime.settime()  # Set RTC with the current time from NTP
-        print("Time set from NTP server.")
+        ntptime.settime()  # Sets UTC
+        print("Time set from NTP server (UTC).")
     except Exception as e:
         print("Failed to set time from NTP server:", e)
         raise RuntimeError('Failed to set time from NTP server')
 
+    print(get_iso_time())
 
-    current_time=utime.localtime()
-    offset = 1 * 3600  # UTC+1 in seconds
-        
-    dst_active = (
-        (current_time[1] > 3 and current_time[1] < 10) or
-        (current_time[1] == 3 and current_time[2] >= 28) or
-        (current_time[1] == 10 and current_time[2] < 28)
-    )
+def get_localtime():
+    # Get UTC time
+    now = utime.time()
+    utc = utime.localtime(now)
 
-    if dst_active:
-        offset += 3600  # Additional +1 for DST
-    
-    now=time()
-    cet=localtime(now+offset)
-    RTC().datetime((cet[0], cet[1], cet[2], cet[6] + 1, cet[3], cet[4], cet[5], 0))
-    print("Local time after synchronization：%s" %str(localtime()))
-            
+    # Base offset for CET
+    offset = 1 * 3600  # UTC+1
+
+    # DST rule: last Sunday of March until last Sunday of October
+    year, month, mday, hour, minute, second, weekday, yearday = utc
+
+    # DST active if:
+    # - after last Sunday of March
+    # - before last Sunday of October
+    # Simplified check:
+    if (month > 3 and month < 10) or \
+            (month == 3 and mday - weekday >= 25) or \
+            (month == 10 and mday - weekday < 25):
+        offset += 3600  # Add 1h for summer time (CEST)
+
+    # Apply offset
+    cet = utime.localtime(now + offset)
+    return cet
+
+def get_iso_time():
+    """Return local time as ISO string YYYY-MM-DDTHH:MM:SS."""
+    t = get_localtime()
+    return "%04d-%02d-%02dT%02d:%02d:%02d" % t[:6]
+
+
 def disconnectWifi():
     try:
-        wlan = network.WLAN(network.STA_IF)
-        wlan.disconnect()
-        wlan.active(False)
-        wlan.deinit()
+        station = network.WLAN(network.STA_IF)
+        if station.isconnected():
+            station.disconnect()
+        station.active(False)
     except:
         print("Error disconnecting wifi")
         raise RuntimeError("Error disconnecting wifi")
-        
+
 
 def connectMQTT():
     client = -1
     try:
-        client = MQTTClient(client_id=b"YOUR_CLIENT_ID", server=b"YOUR_MQTT_SERVER", port=8883,
-                    user=b"YOUR_USER",password=b"YOUR_PASSWORD", keepalive=4000, ssl=True,
-                    ssl_params={'server_hostname':'YOUR_MQTT_SERVER'}
-        )
+        client = MQTTClient(client_id=secrets.MQTT_CLIENT, server=secrets.MQTT_SERVER, port=8883,
+                            user=secrets.MQTT_USERNAME, password=secrets.MQTT_PASSWORD, keepalive=4000, ssl=True,
+                            ssl_params={'server_hostname': secrets.MQTT_SERVER}
+                            )
 
         client.set_callback(on_message)
         client.connect()
@@ -128,7 +134,6 @@ def disconnect(client):
     except:
         print("Error disconnecting client")
         raise RuntimeError("Error disconnecting from mqtt client")
-        
 
 def publish(client,topic, payload):
     try:
@@ -149,52 +154,51 @@ def subscribe(client,topic):
 
 #callback used when mqtt recieves a message
 def on_message(topic, msg):
-
-    global MOISTURELIMIT, ACTIVATE_PUMP_FOR, MISURATION_INTERVAL, IRRIGATE_NOW, SETTINGS_SAVED
+    global SETTINGS, SETTINGS_SAVED, IRRIGATE_NOW
 
     print("message recieved on topic: ", topic)
     print("message: " + msg.decode())
 
     decoded_msg = msg.decode()
-    
-    if (topic == b'new_moisture_limit'):
-        if MOISTURELIMIT != int(decoded_msg):
-            MOISTURELIMIT = int(decoded_msg)
+
+    if topic == b'new_moisture_limit':
+        if SETTINGS["MOISTURE_LIMIT"] != int(decoded_msg):
+            SETTINGS["MOISTURE_LIMIT"] = int(decoded_msg)
             SETTINGS_SAVED = False
-    elif(topic == b'new_active_pump_for'):
-        if ACTIVATE_PUMP_FOR != int(decoded_msg):
-            ACTIVATE_PUMP_FOR = int(decoded_msg)
+    elif topic == b'new_active_pump_for':
+        if SETTINGS["ACTIVE_PUMP_FOR"] != int(decoded_msg):
+            SETTINGS["ACTIVE_PUMP_FOR"] = int(decoded_msg)
             SETTINGS_SAVED = False
-    elif(topic == b'new_misuration_interval'):
-        if MISURATION_INTERVAL != int(decoded_msg):
-            MISURATION_INTERVAL = int(decoded_msg)
+    elif topic == b'new_misuration_interval':
+        if SETTINGS["MISURATION_INTERVAL"] != int(decoded_msg):
+            SETTINGS["MISURATION_INTERVAL"] = int(decoded_msg)
             SETTINGS_SAVED = False
-    elif(topic == b'irrigate_now'):
+    elif topic == b'irrigate_now':
         IRRIGATE_NOW = bool(decoded_msg)
-    
-#make json format data for mqtt publishing
+
+# make json format data for mqtt publishing
 def makeData(temp, hum, soil_moisture, time_of_misuration, battery_level):
     data = {
-        "temperature" : temp,
-        "humidity" : hum,
-        "soil_moisture": round(soil_moisture,1),
-        "soil_moisture_limit": MOISTURELIMIT,
-        "irrigation_time": LAST_IRRIGATION,
+        "temperature": temp,
+        "humidity": hum,
+        "soil_moisture": round(soil_moisture, 1),
+        "soil_moisture_limit": SETTINGS["MOISTURE_LIMIT"],
+        "irrigation_time": SETTINGS["LAST_IRRIGATION"],
         "timeOfmisuration": time_of_misuration,
-        "misuration_interval": MISURATION_INTERVAL,
-        "activate_pump_for": ACTIVATE_PUMP_FOR,
+        "misuration_interval": SETTINGS["MISURATION_INTERVAL"],
+        "activate_pump_for": SETTINGS["ACTIVE_PUMP_FOR"],
         "battery_level": battery_level
     }
     return data
 
-def ToggleWaterPump(waterPump):
+def activatePump(waterPump):
     waterPump.value(1)
-    sleep(ACTIVATE_PUMP_FOR)
+    sleep(SETTINGS["ACTIVE_PUMP_FOR"])
     waterPump.value(0)
 
-#map value -> from raw adc value to percentage
+# map value -> from raw adc value to percentage
 def mapValue(x, fromMin, fromMax, toMin, toMax):
-     return (x - fromMin) * (toMax - toMin) // (fromMax - fromMin) + toMin
+    return (x - fromMin) * (toMax - toMin) // (fromMax - fromMin) + toMin
 
 def check_battery(battery):
     level = battery.read_u16() * (3.3 / 65535) * VOLTAGE_DROP_FACTOR
@@ -203,10 +207,10 @@ def check_battery(battery):
 def medium_battery_level(battery):
     records = []
     total = 0
-    for i in range(20):
+    for i in range(10):
         level = check_battery(battery)
         records.append(level)
-        sleep(0.5)
+        sleep(0.1)
     for value in records:
         total += value
     return total / len(records)
@@ -215,26 +219,26 @@ def wakeup():
     for i in range(28):
         if i not in [0, 3, 14, 15, 25, 26]:  # Alcuni GPIO sono usati, come il LED integrato
             gpio = Pin(i, Pin.OUT)
-    
+
     sleep(0.5)
-    
+
     clock_speed = 125000000
     machine.freq(clock_speed)
-    
+
     sleep(0.5)
 
 def gosleep():
     for i in range(28):
         if i not in [25, 14, 15, 0]:  # Alcuni GPIO sono usati, come il LED integrato
             gpio = Pin(i, Pin.IN)
-            
-    sleep(0.5) 
-     
+
+    sleep(0.5)
+
     clock_speed = 48000000
     machine.freq(clock_speed)
-    
+
     sleep(0.5)
-    
+
 def delay(seconds):
     seconds = seconds / 60
     for _ in range(seconds):
@@ -254,14 +258,16 @@ def deepsleep(seconds):
     print("waking up!")
     wakeup()
     sleep(0.1)
-    
-def wakeupsensors(tempsensor_power, soil_power):
+
+def wakeupsensors(tempsensor_power, soil_power, waterPump_power):
     tempsensor_power.value(1)
     soil_power.value(1)
+    waterPump_power.value(1)
 
-def gosleepsensors(tempsensor_power, soil_power):
+def gosleepsensors(tempsensor_power, soil_power, waterPump_power):
     tempsensor_power.value(0)
     soil_power.value(0)
+    waterPump_power.value(0)
         
 def writelogs(filename, message):
     try:
@@ -273,71 +279,33 @@ def writelogs(filename, message):
         raise RuntimeError('Error writing file')
 
 def get_settings():
-    global MOISTURELIMIT, ACTIVE_PUMP_FOR, MISURATION_INTERVAL, LAST_IRRIGATION
-    file = None
+    """Load settings from file, create defaults if missing/invalid."""
+    global SETTINGS_FILE, SETTINGS
     try:
+        # If file does not exist or is empty, write defaults
+        if not SETTINGS_FILE in os.listdir() or os.stat(SETTINGS_FILE)[6] == 0:
+            save_settings()
+            return
 
-        # if txt is empty (0 byte) write default settings and use them
-        if os.stat("settings.txt")[6] == 0:
-            file = open("settings.txt", "w")
-            default_setting = {'MOISTURELIMIT': 15, 'ACTIVE_PUMP_FOR': 5, 'MISURATION_INTERVAL': 3600, 'LAST_IRRIGATION': 0}
-            file.write(str(default_setting))
-            file.close()
+        with open(SETTINGS_FILE, "r") as f:
+            SETTINGS = json.load(f)
+        return
 
-        file = open("settings.txt", "r")
-        
-        # string format use ' instead of " -> replace it to avoid errors with json.load() method
-        raw_settings = file.read()
-        raw_settings = raw_settings.replace("'", '"')
-
-        # load content in json format
-        settings = json.loads(raw_settings)
-
-        # load settings from json data
-        MOISTURELIMIT = settings["MOISTURELIMIT"]
-        ACTIVE_PUMP_FOR = settings["ACTIVE_PUMP_FOR"]
-        MISURATION_INTERVAL = settings["MISURATION_INTERVAL"] 
-        LAST_IRRIGATION = settings["LAST_IRRIGATION"]
-
-        file.close()
-        file = None
-        
     except Exception as e:
-        print("error: ", e)
-    finally:
-        # Ensure the file is closed 
-        if file is not None:
-            file.close()
-            file = None
-            print("closing file...")
-        print("configured saved settings")
+        raise RuntimeError("⚠️ Error loading settings:", e)
 
 def save_settings():
-    global SETTINGS_SAVED
-    file = None
+    """Save settings dictionary to file in JSON format."""
+    global SETTINGS_FILE, SETTINGS, SETTINGS_SAVED
     try:
-        #clear .txt file
-        file = open("settings.txt", "w")
-        
-        #save actual setting parameters
-        settings = {'MOISTURELIMIT': MOISTURELIMIT, 'ACTIVE_PUMP_FOR': ACTIVE_PUMP_FOR, 'MISURATION_INTERVAL': MISURATION_INTERVAL, "LAST_IRRIGATION": LAST_IRRIGATION}
-
-        #write new dictionary in .txt file
-        file.write(str(settings))
-        SETTINGS_SAVED = True
-        
-        file.close()
-        file = None
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(SETTINGS, f)
+            SETTINGS_SAVED = True
     except Exception as e:
-        print("error: ", e)
-    finally:
-        # Ensure the file is closed 
-        if file is not None:
-            file.close()
-            file = None
-            print("closing file...")
-    
+        raise RuntimeError("⚠️ Error saving settings:", e)
+
 def main():
+    global SETTINGS, SETTINGS_SAVED, IRRIGATE_NOW
 
     #   reset clock speed to 125MHz
     clock_speed = 125000000
@@ -345,13 +313,12 @@ def main():
     
     sleep(0.1)
 
-    global IRRIGATE_NOW, LAST_IRRIGATION, SETTINGS_SAVED
-    time_of_misuration = 0
     get_settings()
     
     #   Power supply pin
     tempsensor_power = Pin(2, Pin.OUT)
     soil_power = Pin(22, Pin.OUT)
+    waterPump_power = Pin(4, Pin.OUT)
     
     #   Data pin
     waterPump = Pin(0, Pin.OUT) #relay data pin
@@ -367,50 +334,46 @@ def main():
     while(1):
         try:
             status_led.value(1) #status led on
+            wakeupsensors(tempsensor_power, soil_power, waterPump_power)
+            sleep(1)
+
             connectWifi()
             client = connectMQTT()
-             
-            subscribe(client,"new_moisture_limit")
-            subscribe(client,"new_active_pump_for")
-            subscribe(client,"new_misuration_interval")
-            subscribe(client,"irrigate_now")
-            
-            wakeupsensors(tempsensor_power,soil_power)
-            sleep(5)
+
+            subscribe(client, "new_moisture_limit")
+            subscribe(client, "new_active_pump_for")
+            subscribe(client, "new_misuration_interval")
+            subscribe(client, "irrigate_now")
 
             client.check_msg()
-            print("soil limit ", MOISTURELIMIT)
-            print("irrigate now: ", IRRIGATE_NOW)
-
-            tempsensor.measure()
-            temperature = tempsensor.temperature()
-            humidity = tempsensor.humidity()
-
-            print("Temp: ", temperature)
-            print("Hum: ", humidity)
+            print("soil limit ", SETTINGS["MOISTURE_LIMIT"])
+            print("irrigate now: ", SETTINGS["IRRIGATE_NOW"])
 
             moisture = soil.read_u16()
-            moisture = mapValue(moisture,39500,14000,0,100)
-            print("moisture: " + "%.2f" % moisture +"% (adc: "+str(soil.read_u16())+")")
-            
+            moisture = mapValue(moisture, 39500, 14000, 0, 100)
+            print("moisture: " + "%.2f" % moisture + "% (adc: " + str(soil.read_u16()) + ")")
+
+            tempsensor.measure()
+            temp = tempsensor.temperature()
+            hum = tempsensor.humidity()
+
             battery_level = medium_battery_level(battery)
-            print("battery_level: " + "%.2f" % battery_level +"V")
-            
-            time_of_misuration = "%4d-%02d-%02dT%02d:%02d:%02d" % localtime()[:6] #converte tuple di localtime un una stringa in formato ISO (due cifre per hh,mm,ss es. 2sec -> 02sec)
+            print("battery_level: " + "%.2f" % battery_level + "V")
+
+            time_of_misuration = get_iso_time()  # converte tuple di localtime un una stringa in formato ISO (due cifre per hh,mm,ss es. 2sec -> 02sec)
             print("time_of_misuration:", time_of_misuration)
 
-            if(moisture < MOISTURELIMIT or IRRIGATE_NOW):
-                 ToggleWaterPump(waterPump)
-                 LAST_IRRIGATION = time_of_misuration
-                 print("irrigation_time:", LAST_IRRIGATION)
-                 IRRIGATE_NOW = False
-                 SETTINGS_SAVED = False
-                 
-            writelogs('logfile.txt', time_of_misuration)
-            data = json.dumps(makeData(temperature, humidity, moisture, time_of_misuration, battery_level))
-            publish(client,"picoW/sensor",data)
-            
-            gosleepsensors(tempsensor_power,soil_power)
+            if moisture < SETTINGS["MOISTURE_LIMIT"] or IRRIGATE_NOW:
+                activatePump(waterPump)
+                SETTINGS["LAST_IRRIGATION"] = time_of_misuration
+                SETTINGS["IRRIGATE_NOW"] = False
+                SETTINGS["SETTINGS_SAVED"] = False
+                print("irrigation_time:", SETTINGS["LAST_IRRIGATION"])
+
+            data = json.dumps(makeData(temp, hum, moisture, time_of_misuration, battery_level))
+            publish(client, "picoW/sensor", data)
+
+            gosleepsensors(tempsensor_power, soil_power, waterPump_power)
             disconnect(client)
             disconnectWifi()
 
@@ -424,12 +387,13 @@ def main():
             sleep(5)
             reset()
         
-        if(not SETTINGS_SAVED):
+        if not SETTINGS_SAVED:
             save_settings()
         sleep(1)
         status_led.value(0) #status led off
-        print("Going to deep sleep for 1 hour...")   
-        deepsleep(3600)
+        print("Going to deep sleep for 1 hour...")
+        interval_ms = int(SETTINGS["MISURATION_INTERVAL"]) * 1000
+        deepsleep(interval_ms)
         print("Woke up from deep sleep!")
 
 if __name__ == "__main__":
